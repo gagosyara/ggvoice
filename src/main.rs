@@ -19,19 +19,21 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
 };
 
-// === ВСТАВЬ СЮДА СВОЮ ССЫЛКУ НА CLOUDFLARE WORKER ===
+// === КОНФИГУРАЦИЯ ПРОЕКТА И GITHUB RELEASES ===
+const APP_VERSION: &str = "1.0.1";
+const GITHUB_REPO: &str = "gagosyara/ggvoice";
+const GITHUB_RELEASES_LATEST_URL: &str = "https://github.com/gagosyara/ggvoice/releases/latest";
 const BEACON_URL: &str = "https://ggvoice-beacon.nikiforgagos.workers.dev";
 const WINDOW_TITLE: &str = "GGVOICE.EXE";
 
@@ -61,6 +63,70 @@ fn to_wide_null(s: &str) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+fn open_url_in_browser(url: &str) {
+    unsafe {
+        let wide_op = to_wide_null("open");
+        let wide_url = to_wide_null(url);
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            wide_op.as_ptr(),
+            wide_url.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+fn parse_semver_tuple(ver: &str) -> Option<(u32, u32, u32)> {
+    let clean = ver.trim().trim_start_matches(['v', 'V']);
+    let core = clean.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+    let patch = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+    Some((major, minor, patch))
+}
+
+fn is_newer_version(latest_tag: &str, current_ver: &str) -> bool {
+    match (parse_semver_tuple(latest_tag), parse_semver_tuple(current_ver)) {
+        (Some(lat), Some(cur)) => lat > cur,
+        _ => false,
+    }
+}
+
+fn extract_json_string_field(json: &str, field_name: &str) -> Option<String> {
+    let needle = format!("\"{}\":", field_name);
+    let idx = json.find(&needle)?;
+    let rest = json[idx + needle.len()..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+struct UpdateInfo {
+    tag_name: String,
+    html_url: String,
+}
+
+fn check_github_latest_release() -> Option<UpdateInfo> {
+    let api_url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
+    let resp = ureq::get(&api_url)
+        .timeout(Duration::from_secs(4))
+        .set("User-Agent", "GGVoice-Client")
+        .set("Accept", "application/vnd.github+json")
+        .call()
+        .ok()?;
+    let body = resp.into_string().ok()?;
+    let tag_name = extract_json_string_field(&body, "tag_name")?;
+    if !is_newer_version(&tag_name, APP_VERSION) {
+        return None;
+    }
+    let html_url = extract_json_string_field(&body, "html_url")
+        .unwrap_or_else(|| GITHUB_RELEASES_LATEST_URL.to_string());
+    Some(UpdateInfo { tag_name, html_url })
 }
 
 fn focus_existing_window(title: &str) {
@@ -1140,6 +1206,7 @@ struct GGVoiceApp {
     cons_in_shared: Arc<Mutex<ringbuf::HeapCons<f32>>>,
     prod_out_shared: Arc<Mutex<ringbuf::HeapProd<f32>>>,
     prod_lb_shared: Arc<Mutex<ringbuf::HeapProd<f32>>>,
+    available_update: Arc<Mutex<Option<UpdateInfo>>>,
     desk_texture: Option<egui::TextureHandle>,
     welcome_game: MiniGameAnim,
     input_stream: Option<cpal::Stream>,
@@ -1726,6 +1793,14 @@ impl GGVoiceApp {
             }
         });
 
+        let available_update = Arc::new(Mutex::new(None));
+        let update_slot = available_update.clone();
+        thread::spawn(move || {
+            if let Some(info) = check_github_latest_release() {
+                *update_slot.lock().unwrap() = Some(info);
+            }
+        });
+
         Self {
             state,
             client_id: prefs.client_id,
@@ -1742,6 +1817,7 @@ impl GGVoiceApp {
             cons_in_shared,
             prod_out_shared,
             prod_lb_shared,
+            available_update,
             desk_texture,
             welcome_game: MiniGameAnim::default(),
             input_stream: Some(input_stream),
@@ -2454,12 +2530,42 @@ impl eframe::App for GGVoiceApp {
                 );
             }
 
-            ui.label(
-                egui::RichText::new("▲ GGVoice_NODE // v1.0")
-                    .size(10.5)
-                    .strong()
-                    .color(RETRO_PINK),
-            );
+            let update_prompt: Option<(String, String)> = self
+                .available_update
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|u| (u.tag_name.clone(), u.html_url.clone()));
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("▲ GGVoice_NODE // v{}", APP_VERSION))
+                        .size(10.5)
+                        .strong()
+                        .color(RETRO_PINK),
+                );
+
+                if let Some((tag, url)) = update_prompt {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label_txt = if tag.starts_with(['v', 'V']) {
+                            format!("ОБНОВИТЬ {}", tag)
+                        } else {
+                            format!("ОБНОВИТЬ v{}", tag)
+                        };
+                        let upd_btn = egui::Button::new(
+                            egui::RichText::new(label_txt)
+                                .size(9.0)
+                                .strong()
+                                .color(VOID_BLACK),
+                        )
+                        .fill(CYBER_MINT);
+
+                        if ui.add_sized([118.0, 18.0], upd_btn).clicked() {
+                            open_url_in_browser(&url);
+                        }
+                    });
+                }
+            });
 
             ui.add_space(4.0);
 
@@ -2717,63 +2823,10 @@ impl eframe::App for GGVoiceApp {
     }
 }
 
-fn ensure_firewall_rule() {
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    if let Ok(exe_path) = std::env::current_exe() {
-        let path_str = exe_path.to_string_lossy();
-
-        let _ = Command::new("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "delete",
-                "rule",
-                "name=GGVoice P2P",
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-
-        let program_arg = format!("program={}", path_str);
-        let _ = Command::new("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                "name=GGVoice P2P",
-                "dir=in",
-                "action=allow",
-                &program_arg,
-                "enable=yes",
-                "profile=any",
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-
-        let _ = Command::new("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                "name=GGVoice P2P",
-                "dir=out",
-                "action=allow",
-                &program_arg,
-                "enable=yes",
-                "profile=any",
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-    }
-}
-
 fn main() -> eframe::Result<()> {
     if acquire_single_instance_or_focus() {
         return Ok(());
     }
-
-    ensure_firewall_rule();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
