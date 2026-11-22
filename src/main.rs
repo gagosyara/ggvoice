@@ -31,7 +31,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 // === КОНФИГУРАЦИЯ ПРОЕКТА И GITHUB RELEASES ===
-const APP_VERSION: &str = "1.0.1";
+const APP_VERSION: &str = "1.0.2";
 const GITHUB_REPO: &str = "gagosyara/ggvoice";
 const GITHUB_RELEASES_LATEST_URL: &str = "https://github.com/gagosyara/ggvoice/releases/latest";
 const BEACON_URL: &str = "https://ggvoice-beacon.nikiforgagos.workers.dev";
@@ -57,6 +57,64 @@ const RETRO_PINK_DIM: egui::Color32 = egui::Color32::from_rgb(120, 24, 68);
 const RETRO_GRAY: egui::Color32 = egui::Color32::from_rgb(150, 153, 165);
 const RETRO_BORDER: egui::Color32 = egui::Color32::from_rgb(105, 108, 120);
 const CYBER_MINT: egui::Color32 = egui::Color32::from_rgb(45, 226, 150);
+
+#[derive(Clone, Copy)]
+enum UiCueKind {
+    Join,
+    Leave,
+}
+
+fn synth_join_samples(sample_rate: u32) -> Vec<f32> {
+    let sr = sample_rate.max(8000) as f32;
+    let mut samples = Vec::new();
+    let mut phase = 0.0_f32;
+
+    let append_smooth_note = |out: &mut Vec<f32>,
+                            phase_acc: &mut f32,
+                            freq: f32,
+                            dur_sec: f32,
+                            amp: f32| {
+        let total = ((dur_sec * sr).round() as usize).max(1);
+        let two_pi = std::f32::consts::TAU;
+        let phase_step = two_pi * freq / sr;
+
+        for i in 0..total {
+            let p = i as f32 / (total.max(1) as f32);
+            let env = 0.5 * (1.0 - (two_pi * p.min(0.5)).cos())
+                * if p > 0.5 {
+                    0.5 * (1.0 + (std::f32::consts::PI * ((p - 0.5) * 2.0)).cos())
+                } else {
+                    1.0
+                };
+            let s = phase_acc.sin() * amp * env;
+            *phase_acc = (*phase_acc + phase_step) % two_pi;
+            out.push(s);
+        }
+    };
+
+    let append_silence = |out: &mut Vec<f32>, phase_acc: &mut f32, freq_hold: f32, dur_sec: f32| {
+        let total = ((dur_sec * sr).round() as usize).max(1);
+        let two_pi = std::f32::consts::TAU;
+        let phase_step = two_pi * freq_hold / sr;
+        for _ in 0..total {
+            *phase_acc = (*phase_acc + phase_step) % two_pi;
+            out.push(0.0);
+        }
+    };
+
+    append_smooth_note(&mut samples, &mut phase, 440.0, 0.075, 0.085);
+    append_silence(&mut samples, &mut phase, 440.0, 0.020);
+    append_smooth_note(&mut samples, &mut phase, 659.25, 0.115, 0.090);
+    samples
+}
+
+fn synth_ui_cue(kind: UiCueKind, sample_rate: u32) -> Vec<f32> {
+    let mut samples = synth_join_samples(sample_rate);
+    if matches!(kind, UiCueKind::Leave) {
+        samples.reverse();
+    }
+    samples
+}
 
 fn to_wide_null(s: &str) -> Vec<u16> {
     OsStr::new(s)
@@ -141,33 +199,57 @@ fn focus_existing_window(title: &str) {
     }
 }
 
+fn lock_file_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("GGVoice").join("ggvoice.lock"))
+}
+
+fn release_single_instance_lock() {
+    if let Some(path) = lock_file_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn acquire_single_instance_or_focus() -> bool {
-    if let Some(app_data) = std::env::var_os("APPDATA") {
-        let dir = PathBuf::from(app_data).join("GGVoice");
-        let _ = std::fs::create_dir_all(&dir);
-        let lock_path = dir.join("ggvoice.lock");
+    use std::io::Write;
+    if let Some(lock_path) = lock_file_path() {
+        if let Some(parent) = lock_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
 
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&lock_path)
         {
-            Ok(file) => {
+            Ok(mut file) => {
+                let _ = writeln!(file, "pid={}", std::process::id());
                 std::mem::forget(file);
                 return false;
             }
             Err(_) => {
                 focus_existing_window(WINDOW_TITLE);
+                let is_fresh_lock = std::fs::metadata(&lock_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|age| age < Duration::from_millis(2500))
+                    .unwrap_or(false);
+
+                if is_fresh_lock {
+                    return true;
+                }
+
                 unsafe {
                     let wide_title = to_wide_null(WINDOW_TITLE);
                     let hwnd = FindWindowW(std::ptr::null(), wide_title.as_ptr());
                     if hwnd.is_null() {
                         let _ = std::fs::remove_file(&lock_path);
-                        if let Ok(file) = std::fs::OpenOptions::new()
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
                             .write(true)
                             .create_new(true)
                             .open(&lock_path)
                         {
+                            let _ = writeln!(file, "pid={}", std::process::id());
                             std::mem::forget(file);
                             return false;
                         }
@@ -193,6 +275,8 @@ struct UserPrefs {
     ptt_enabled: bool,
     ptt_vk: i32,
     boost_enabled: bool,
+    sounds_enabled: bool,
+    ns_level: i32,
     mic_device: String,
     out_device: String,
 }
@@ -214,6 +298,8 @@ fn load_prefs(fallback_nick: &str) -> UserPrefs {
         ptt_enabled: false,
         ptt_vk: 0x56, // V по умолчанию
         boost_enabled: false,
+        sounds_enabled: true,
+        ns_level: 6,
         mic_device: String::new(),
         out_device: String::new(),
     };
@@ -246,6 +332,12 @@ fn load_prefs(fallback_nick: &str) -> UserPrefs {
                     }
                 } else if let Some(val) = line.strip_prefix("boost=") {
                     prefs.boost_enabled = val.trim() == "1";
+                } else if let Some(val) = line.strip_prefix("sounds=") {
+                    prefs.sounds_enabled = val.trim() == "1";
+                } else if let Some(val) = line.strip_prefix("ns=") {
+                    if let Ok(n) = val.trim().parse::<i32>() {
+                        prefs.ns_level = n.clamp(1, 10);
+                    }
                 } else if let Some(val) = line.strip_prefix("mic=") {
                     prefs.mic_device = val.trim().to_string();
                 } else if let Some(val) = line.strip_prefix("out=") {
@@ -266,6 +358,8 @@ fn save_prefs(
     ptt_enabled: bool,
     ptt_vk: i32,
     boost_enabled: bool,
+    sounds_enabled: bool,
+    ns_level: i32,
     mic_device: &str,
     out_device: &str,
 ) {
@@ -280,9 +374,11 @@ fn save_prefs(
         let clean_out = out_device.replace(['\r', '\n'], "");
         let ptt_flag = if ptt_enabled { "1" } else { "0" };
         let boost_flag = if boost_enabled { "1" } else { "0" };
+        let sounds_flag = if sounds_enabled { "1" } else { "0" };
+        let clean_ns = ns_level.clamp(1, 10);
         let data = format!(
-            "id={}\nnick={}\nroom={}\npass={}\nptt={}\nptt_vk={}\nboost={}\nmic={}\nout={}\n",
-            client_id, clean_nick, clean_room, clean_pass, ptt_flag, ptt_vk, boost_flag, clean_mic, clean_out
+            "id={}\nnick={}\nroom={}\npass={}\nptt={}\nptt_vk={}\nboost={}\nsounds={}\nns={}\nmic={}\nout={}\n",
+            client_id, clean_nick, clean_room, clean_pass, ptt_flag, ptt_vk, boost_flag, sounds_flag, clean_ns, clean_mic, clean_out
         );
         let _ = std::fs::write(path, data);
     }
@@ -427,50 +523,19 @@ fn derive_room_secrets(room_name: &str, password: &str) -> (String, [u8; 32]) {
     (room_hash_hex, key)
 }
 
-fn encrypt_addr_blob(addr: SocketAddr, key: &[u8; 32]) -> String {
-    let mut raw = [0u8; 6];
-    if let SocketAddr::V4(v4) = addr {
-        raw[0..4].copy_from_slice(&v4.ip().octets());
-        raw[4..6].copy_from_slice(&v4.port().to_be_bytes());
-    }
-    let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let cipher = ChaCha20Poly1305::new(key.into());
-    let ct = cipher.encrypt(nonce, raw.as_ref()).unwrap_or_default();
 
-    let mut out = Vec::with_capacity(12 + ct.len());
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ct);
-    URL_SAFE_NO_PAD.encode(&out)
-}
-
-fn decrypt_addr_blob(blob: &str, key: &[u8; 32]) -> Result<SocketAddr> {
-    let data = URL_SAFE_NO_PAD.decode(blob)?;
-    if data.len() < 12 + 6 {
-        return Err(anyhow!("Invalid blob"));
-    }
-    let nonce = Nonce::from_slice(&data[..12]);
-    let cipher = ChaCha20Poly1305::new(key.into());
-    let pt = cipher
-        .decrypt(nonce, &data[12..])
-        .map_err(|_| anyhow!("Wrong password"))?;
-    if pt.len() != 6 {
-        return Err(anyhow!("Bad addr len"));
-    }
-    let ip = Ipv4Addr::new(pt[0], pt[1], pt[2], pt[3]);
-    let port = u16::from_be_bytes([pt[4], pt[5]]);
-    Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
-}
 
 struct PeerNode {
     id: u64,
     name: String,
     addr: SocketAddr,
+    lan_addr: Option<SocketAddr>,
     volume: f32,
     last_seen: Instant,
     last_spoke: Instant,
     connected: bool,
+    last_seq: Option<u64>,
+    jitter_primed: bool,
     decoder: Decoder,
     audio_queue: Vec<f32>,
 }
@@ -492,10 +557,14 @@ struct SharedState {
     ptt_active: AtomicBool,
     loopback_enabled: AtomicBool,
     boost_enabled: AtomicBool,
+    sounds_enabled: AtomicBool,
+    ui_cue_queue: Mutex<Vec<f32>>,
     my_level_bits: AtomicU32,
     my_speaking: AtomicBool,
     status_text: Mutex<String>,
     public_addr: Mutex<SocketAddr>,
+    lan_addr: Mutex<Option<SocketAddr>>,
+    ns_level: AtomicI32, // 1..10 per-user noise suppression strictness (default 6)
     room: RoomState,
 }
 
@@ -507,6 +576,7 @@ impl SharedState {
         ptt_enabled: bool,
         ptt_vk: i32,
         boost_enabled: bool,
+        sounds_enabled: bool,
     ) -> Self {
         Self {
             muted: AtomicBool::new(false),
@@ -516,10 +586,14 @@ impl SharedState {
             ptt_active: AtomicBool::new(false),
             loopback_enabled: AtomicBool::new(false),
             boost_enabled: AtomicBool::new(boost_enabled),
+            sounds_enabled: AtomicBool::new(sounds_enabled),
+            ui_cue_queue: Mutex::new(Vec::new()),
             my_level_bits: AtomicU32::new(0.0_f32.to_bits()),
             my_speaking: AtomicBool::new(false),
             status_text: Mutex::new("Offline".to_string()),
             public_addr: Mutex::new(public_addr),
+            lan_addr: Mutex::new(detect_local_lan_addr(public_addr.port())),
+            ns_level: AtomicI32::new(6),
             room: RoomState {
                 my_id: client_id,
                 my_name: Mutex::new(initial_nick),
@@ -538,11 +612,24 @@ impl SharedState {
     fn set_my_level(&self, lvl: f32) {
         self.my_level_bits.store(lvl.to_bits(), Ordering::Relaxed);
     }
+
+    fn play_cue(&self, kind: UiCueKind, force: bool) {
+        if !force && !self.sounds_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let samples = synth_ui_cue(kind, SAMPLE_RATE);
+        if let Ok(mut q) = self.ui_cue_queue.lock() {
+            q.extend_from_slice(&samples);
+            if q.len() > (SAMPLE_RATE as usize) * 2 {
+                let excess = q.len() - (SAMPLE_RATE as usize) * 2;
+                q.drain(0..excess);
+            }
+        }
+    }
 }
 
-fn discover_public_addr(socket: &UdpSocket) -> Result<SocketAddr> {
-    let stun_server = "stun.l.google.com:19302";
-    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+fn query_single_stun(socket: &UdpSocket, stun_server: &str) -> Result<SocketAddr> {
+    socket.set_read_timeout(Some(Duration::from_millis(1200)))?;
 
     let mut req = [0u8; 20];
     req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
@@ -577,6 +664,87 @@ fn discover_public_addr(socket: &UdpSocket) -> Result<SocketAddr> {
     }
 
     Err(anyhow!("No XOR-MAPPED-ADDRESS"))
+}
+
+fn discover_public_addr(socket: &UdpSocket) -> Result<SocketAddr> {
+    let stun_servers = [
+        "stun.l.google.com:19302",
+        "stun1.l.google.com:19302",
+        "global.stun.twilio.com:3478",
+    ];
+    for srv in stun_servers {
+        if let Ok(addr) = query_single_stun(socket, srv) {
+            return Ok(addr);
+        }
+    }
+    Err(anyhow!("All STUN servers failed"))
+}
+
+fn detect_local_lan_addr(bound_port: u16) -> Option<SocketAddr> {
+    let probe = UdpSocket::bind("0.0.0.0:0").ok()?;
+    let _ = probe.connect("8.8.8.8:80");
+    match probe.local_addr().ok()? {
+        SocketAddr::V4(v4) if !v4.ip().is_loopback() && !v4.ip().is_unspecified() => {
+            Some(SocketAddr::V4(SocketAddrV4::new(*v4.ip(), bound_port)))
+        }
+        _ => None,
+    }
+}
+
+// Encodes WAN (6 bytes) + LAN (6 bytes) -> 12 bytes plaintext inside ChaCha20Poly1305 blob.
+// Backward-compatible with legacy 6-byte blobs on decrypt!
+fn encrypt_endpoints_blob(wan_addr: SocketAddr, lan_addr: Option<SocketAddr>, key: &[u8; 32]) -> String {
+    let mut raw = [0u8; 12];
+    if let SocketAddr::V4(v4) = wan_addr {
+        raw[0..4].copy_from_slice(&v4.ip().octets());
+        raw[4..6].copy_from_slice(&v4.port().to_be_bytes());
+    }
+    if let Some(SocketAddr::V4(l4)) = lan_addr {
+        raw[6..10].copy_from_slice(&l4.ip().octets());
+        raw[10..12].copy_from_slice(&l4.port().to_be_bytes());
+    }
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let ct = cipher.encrypt(nonce, raw.as_ref()).unwrap_or_default();
+
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    URL_SAFE_NO_PAD.encode(&out)
+}
+
+fn decrypt_endpoints_blob(blob: &str, key: &[u8; 32]) -> Result<(SocketAddr, Option<SocketAddr>)> {
+    let data = URL_SAFE_NO_PAD.decode(blob)?;
+    if data.len() < 12 + 6 {
+        return Err(anyhow!("Invalid blob"));
+    }
+    let nonce = Nonce::from_slice(&data[..12]);
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let pt = cipher
+        .decrypt(nonce, &data[12..])
+        .map_err(|_| anyhow!("Wrong password"))?;
+    if pt.len() != 6 && pt.len() != 12 {
+        return Err(anyhow!("Bad addr len"));
+    }
+    let wan_ip = Ipv4Addr::new(pt[0], pt[1], pt[2], pt[3]);
+    let wan_port = u16::from_be_bytes([pt[4], pt[5]]);
+    let wan_addr = SocketAddr::V4(SocketAddrV4::new(wan_ip, wan_port));
+
+    let lan_addr = if pt.len() == 12 {
+        let lan_ip = Ipv4Addr::new(pt[6], pt[7], pt[8], pt[9]);
+        let lan_port = u16::from_be_bytes([pt[10], pt[11]]);
+        if !lan_ip.is_unspecified() && !lan_ip.is_loopback() && lan_port > 0 {
+            Some(SocketAddr::V4(SocketAddrV4::new(lan_ip, lan_port)))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok((wan_addr, lan_addr))
 }
 
 fn parse_mesh_peers(json: &str) -> Vec<(u64, String)> {
@@ -1082,6 +1250,9 @@ fn find_output_device(host: &cpal::Host, desired_name: &str) -> Result<Device> {
 fn build_input_stream_for_device(
     device: &Device,
     mut prod_in: ringbuf::HeapProd<f32>,
+    in_error_flag: Arc<AtomicBool>,
+    in_heartbeat_ms: Arc<AtomicU32>,
+    start_instant: Instant,
 ) -> Result<(cpal::Stream, String)> {
     let dev_name = device.name().unwrap_or_else(|_| "MIC".into());
     let default_in_cfg = device.default_input_config()?;
@@ -1093,14 +1264,19 @@ fn build_input_stream_for_device(
         buffer_size: cpal::BufferSize::Default,
     };
 
+    let err_flag_cb = in_error_flag.clone();
     let stream = device.build_input_stream(
         &in_stream_cfg,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            let now_ms = start_instant.elapsed().as_millis() as u32;
+            in_heartbeat_ms.store(now_ms, Ordering::Relaxed);
             for frame in data.chunks(in_channels) {
                 let _ = prod_in.try_push(frame[0]);
             }
         },
-        |_| {},
+        move |_| {
+            err_flag_cb.store(true, Ordering::Relaxed);
+        },
         None,
     )?;
     stream.play()?;
@@ -1113,6 +1289,7 @@ fn build_output_stream_for_device(
     state: Arc<SharedState>,
     mut cons_out: ringbuf::HeapCons<f32>,
     mut cons_lb: ringbuf::HeapCons<f32>,
+    out_error_flag: Arc<AtomicBool>,
 ) -> Result<(cpal::Stream, String)> {
     let dev_name = device.name().unwrap_or_else(|_| "OUT".into());
     let default_out_cfg = device.default_output_config()?;
@@ -1137,6 +1314,15 @@ fn build_output_stream_for_device(
                 while cons_lb.try_pop().is_some() {}
             }
 
+            let mut cue_samples = Vec::new();
+            if let Ok(mut q) = state.ui_cue_queue.try_lock() {
+                if !q.is_empty() {
+                    let take_n = q.len().min(data.len() / out_channels.max(1));
+                    cue_samples.extend(q.drain(0..take_n));
+                }
+            }
+            let mut cue_idx = 0usize;
+
             for frame in data.chunks_mut(out_channels) {
                 let net_s = if has_net {
                     cons_out.try_pop().unwrap_or(0.0)
@@ -1148,11 +1334,18 @@ fn build_output_stream_for_device(
                 } else {
                     0.0
                 };
+                let cue_s = if cue_idx < cue_samples.len() {
+                    let v = cue_samples[cue_idx];
+                    cue_idx += 1;
+                    v
+                } else {
+                    0.0
+                };
 
                 let mixed = if deaf {
-                    0.0
+                    cue_s.clamp(-0.99, 0.99)
                 } else {
-                    (net_s + lb_s).clamp(-0.99, 0.99)
+                    (net_s + lb_s + cue_s).clamp(-0.99, 0.99)
                 };
 
                 for ch in frame.iter_mut() {
@@ -1160,7 +1353,9 @@ fn build_output_stream_for_device(
                 }
             }
         },
-        |_| {},
+        move |_| {
+            out_error_flag.store(true, Ordering::Relaxed);
+        },
         None,
     )?;
     stream.play()?;
@@ -1209,6 +1404,11 @@ struct GGVoiceApp {
     available_update: Arc<Mutex<Option<UpdateInfo>>>,
     desk_texture: Option<egui::TextureHandle>,
     welcome_game: MiniGameAnim,
+    audio_epoch: Instant,
+    in_error_flag: Arc<AtomicBool>,
+    in_heartbeat_ms: Arc<AtomicU32>,
+    out_error_flag: Arc<AtomicBool>,
+    last_audio_recovery: Instant,
     input_stream: Option<cpal::Stream>,
     output_stream: Option<cpal::Stream>,
 }
@@ -1295,7 +1495,9 @@ impl GGVoiceApp {
             prefs.ptt_enabled,
             prefs.ptt_vk,
             prefs.boost_enabled,
+            prefs.sounds_enabled,
         ));
+        state.ns_level.store(prefs.ns_level.clamp(1, 10), Ordering::Relaxed);
 
         socket.set_nonblocking(true).unwrap();
         let socket_tx = socket.try_clone().unwrap();
@@ -1313,9 +1515,20 @@ impl GGVoiceApp {
         let prod_out_shared = Arc::new(Mutex::new(prod_out_raw));
         let prod_lb_shared = Arc::new(Mutex::new(prod_lb_raw));
 
+        let audio_epoch = Instant::now();
+        let in_error_flag = Arc::new(AtomicBool::new(false));
+        let in_heartbeat_ms = Arc::new(AtomicU32::new(0));
+        let out_error_flag = Arc::new(AtomicBool::new(false));
+
         let input_device = find_input_device(&host, &prefs.mic_device).expect("Mic not found");
-        let (input_stream, mic_name) =
-            build_input_stream_for_device(&input_device, prod_in).unwrap();
+        let (input_stream, mic_name) = build_input_stream_for_device(
+            &input_device,
+            prod_in,
+            in_error_flag.clone(),
+            in_heartbeat_ms.clone(),
+            audio_epoch,
+        )
+        .unwrap();
 
         let output_device =
             find_output_device(&host, &prefs.out_device).expect("Headphones not found");
@@ -1324,6 +1537,7 @@ impl GGVoiceApp {
             state.clone(),
             cons_out,
             cons_lb,
+            out_error_flag.clone(),
         )
         .unwrap();
 
@@ -1335,6 +1549,8 @@ impl GGVoiceApp {
             prefs.ptt_enabled,
             prefs.ptt_vk,
             prefs.boost_enabled,
+            prefs.sounds_enabled,
+            prefs.ns_level,
             &mic_name,
             &out_name,
         );
@@ -1362,7 +1578,8 @@ impl GGVoiceApp {
 
                     if last_announce.elapsed() >= Duration::from_secs(20) {
                         let pub_addr = *state_beacon.public_addr.lock().unwrap();
-                        let my_blob = encrypt_addr_blob(pub_addr, &key);
+                        let lan_addr = *state_beacon.lan_addr.lock().unwrap();
+                        let my_blob = encrypt_endpoints_blob(pub_addr, lan_addr, &key);
                         let _ = beacon_sync_mesh(&room_hash, my_id, &my_blob);
                         last_announce = Instant::now();
                     }
@@ -1384,12 +1601,17 @@ impl GGVoiceApp {
                                 if pid == my_id {
                                     continue;
                                 }
-                                if let Ok(peer_addr) = decrypt_addr_blob(&blob, &key) {
-                                    targets_to_punch.push(peer_addr);
+                                if let Ok((wan_addr, lan_addr)) = decrypt_endpoints_blob(&blob, &key) {
+                                    if let Some(la) = lan_addr {
+                                        targets_to_punch.push(la);
+                                    }
+                                    targets_to_punch.push(wan_addr);
+                                    let chosen_addr = lan_addr.unwrap_or(wan_addr);
 
                                     if let Some(existing) = peers.get_mut(&pid) {
+                                        existing.lan_addr = lan_addr;
                                         if !existing.connected {
-                                            existing.addr = peer_addr;
+                                            existing.addr = chosen_addr;
                                             existing.last_seen = Instant::now();
                                         }
                                     } else if peers.len() + 1 < MAX_ROOM_USERS {
@@ -1399,11 +1621,14 @@ impl GGVoiceApp {
                                                 PeerNode {
                                                     id: pid,
                                                     name: format!("Player_{:04}", pid % 10000),
-                                                    addr: peer_addr,
+                                                    addr: chosen_addr,
+                                                    lan_addr,
                                                     volume: 1.0,
                                                     last_seen: Instant::now(),
                                                     last_spoke: Instant::now() - Duration::from_secs(5),
                                                     connected: false,
+                                                    last_seq: None,
+                                                    jitter_primed: false,
                                                     decoder: dec,
                                                     audio_queue: Vec::with_capacity(FRAME_SIZE * 6),
                                                 },
@@ -1464,13 +1689,23 @@ impl GGVoiceApp {
                     ping_pkt.push(n_len as u8);
                     ping_pkt.extend_from_slice(&name_bytes[..n_len]);
 
-                    let (peer_addrs, connected_count): (Vec<SocketAddr>, usize) = {
+                    let (peer_addrs, connected_count, any_dropped): (Vec<SocketAddr>, usize, bool) = {
                         let mut peers = state_tx.room.peers.lock().unwrap();
-                        peers.retain(|_, p| p.last_seen.elapsed() < Duration::from_secs(8));
+                        let mut dropped = false;
+                        peers.retain(|_, p| {
+                            let keep = p.last_seen.elapsed() < Duration::from_secs(8);
+                            if !keep && p.connected {
+                                dropped = true;
+                            }
+                            keep
+                        });
                         let addrs = peers.values().map(|p| p.addr).collect();
                         let conn = peers.values().filter(|p| p.connected).count();
-                        (addrs, conn)
+                        (addrs, conn, dropped)
                     };
+                    if any_dropped {
+                        state_tx.play_cue(UiCueKind::Leave, false);
+                    }
 
                     for addr in &peer_addrs {
                         let _ = socket_tx.send_to(&ping_pkt, addr);
@@ -1508,7 +1743,10 @@ impl GGVoiceApp {
                         continue;
                     }
 
-                    // 1. Шумоподавление nnnoiseless + мягкий естественный VAD без дробления слов
+                    // 1. Шумоподавление nnnoiseless + индивидуальная чувствительность VAD (ns_level 1..10)
+                    let ns = state_tx.ns_level.load(Ordering::Relaxed).clamp(1, 10) as f32;
+                    let norm_ns = (ns - 1.0) / 9.0; // 0.0 (мягко) .. 1.0 (строго против фона/телефона)
+
                     let vad_prob = denoise.process_frame(&mut clean_frame, &raw_frame);
                     let mut sum_sq = 0.0f32;
                     for s in clean_frame.iter_mut() {
@@ -1517,10 +1755,17 @@ impl GGVoiceApp {
                     }
                     let rms = (sum_sq / FRAME_SIZE as f32).sqrt();
 
-                    if vad_prob > 0.18 && rms > 0.0022 {
-                        vad_hold_frames = 28;
-                    } else if vad_prob > 0.13 && rms > 0.0045 {
-                        vad_hold_frames = vad_hold_frames.max(16);
+                    let primary_vad_thresh = 0.16 + norm_ns * 0.36; // 0.16 .. 0.52
+                    let primary_rms_thresh = 0.0020 + norm_ns * 0.0065; // 0.0020 .. 0.0085
+                    let secondary_vad_thresh = 0.12 + norm_ns * 0.28; // 0.12 .. 0.40
+                    let secondary_rms_thresh = 0.0040 + norm_ns * 0.0090; // 0.0040 .. 0.0130
+                    let hold_primary: u32 = ((28.0 - norm_ns * 14.0).round() as u32).max(10);
+                    let hold_secondary: u32 = ((16.0 - norm_ns * 8.0).round() as u32).max(6);
+
+                    if vad_prob > primary_vad_thresh && rms > primary_rms_thresh {
+                        vad_hold_frames = hold_primary;
+                    } else if vad_prob > secondary_vad_thresh && rms > secondary_rms_thresh {
+                        vad_hold_frames = vad_hold_frames.max(hold_secondary);
                     } else if vad_hold_frames > 0 {
                         vad_hold_frames -= 1;
                     }
@@ -1532,7 +1777,7 @@ impl GGVoiceApp {
                         state_tx.ptt_active.store(key_down, Ordering::Relaxed);
 
                         if key_down {
-                            ptt_hold_frames = 22;
+                            ptt_hold_frames = 20;
                         } else if ptt_hold_frames > 0 {
                             ptt_hold_frames -= 1;
                         }
@@ -1544,17 +1789,19 @@ impl GGVoiceApp {
 
                     // 2. Плавное открытие и закрытие гейта тишины (без щелчков и «пиксельности»)
                     let target_env = if speaking { 1.0 } else { 0.0 };
+                    let close_step = 0.12 + norm_ns * 0.14;
                     if target_env > gate_env {
-                        gate_env = (gate_env + 0.5).min(1.0);
+                        gate_env = (gate_env + 0.55).min(1.0);
                     } else {
-                        gate_env = (gate_env - 0.12).max(0.0);
+                        gate_env = (gate_env - close_step).max(0.0);
                     }
 
-                    // 3. Опция БУСТ (автоусиление + мягкий лимитер для слабых микрофонов)
+                    // 3. Опция БУСТ (автоусиление + контроль потолка при высоком уровне шумодава)
                     let boost_on = state_tx.boost_enabled.load(Ordering::Relaxed);
+                    let capped_max_gain = MAX_GAIN - norm_ns * 2.5; // 6.5 .. 4.0
                     if boost_on {
-                        if speaking && vad_prob > 0.22 && rms > 0.0025 {
-                            let desired_gain = (TARGET_RMS / rms).clamp(MIN_GAIN, MAX_GAIN);
+                        if speaking && vad_prob > (primary_vad_thresh * 0.85) && rms > primary_rms_thresh {
+                            let desired_gain = (TARGET_RMS / rms).clamp(MIN_GAIN, capped_max_gain);
                             if desired_gain < current_gain {
                                 current_gain = current_gain * 0.85 + desired_gain * 0.15;
                             } else {
@@ -1671,9 +1918,13 @@ impl GGVoiceApp {
 
                                 let mut peers = state_rx.room.peers.lock().unwrap();
                                 if let Some(p) = peers.get_mut(&sender_id) {
+                                    let was_conn = p.connected;
                                     p.addr = src;
                                     p.last_seen = Instant::now();
                                     p.connected = true;
+                                    if !was_conn {
+                                        state_rx.play_cue(UiCueKind::Join, false);
+                                    }
                                     if !name.is_empty() {
                                         p.name = name;
                                     }
@@ -1689,10 +1940,13 @@ impl GGVoiceApp {
                                                     name
                                                 },
                                                 addr: src,
+                                                lan_addr: None,
                                                 volume: 1.0,
                                                 last_seen: Instant::now(),
                                                 last_spoke: Instant::now() - Duration::from_secs(5),
                                                 connected: true,
+                                                last_seq: None,
+                                                jitter_primed: false,
                                                 decoder: dec,
                                                 audio_queue: Vec::with_capacity(FRAME_SIZE * 6),
                                             },
@@ -1705,6 +1959,8 @@ impl GGVoiceApp {
                                 if sender_id == my_id {
                                     continue;
                                 }
+                                let pkt_seq =
+                                    u64::from_be_bytes(udp_buf[9..17].try_into().unwrap());
 
                                 let mut nonce_bytes = [0u8; 12];
                                 nonce_bytes[4..12].copy_from_slice(&udp_buf[9..17]);
@@ -1725,12 +1981,15 @@ impl GGVoiceApp {
                                                     id: sender_id,
                                                     name: format!("Player_{:04}", sender_id % 10000),
                                                     addr: src,
+                                                    lan_addr: None,
                                                     volume: 1.0,
                                                     last_seen: Instant::now(),
                                                     last_spoke: Instant::now(),
                                                     connected: true,
+                                                    last_seq: None,
+                                                    jitter_primed: false,
                                                     decoder: dec,
-                                                    audio_queue: Vec::with_capacity(FRAME_SIZE * 6),
+                                                    audio_queue: Vec::with_capacity(FRAME_SIZE * 8),
                                                 },
                                             );
                                         }
@@ -1740,14 +1999,41 @@ impl GGVoiceApp {
                                         peer.addr = src;
                                         peer.last_seen = Instant::now();
                                         peer.connected = true;
+
+                                        if let Some(prev_seq) = peer.last_seq {
+                                            if pkt_seq <= prev_seq {
+                                                continue;
+                                            }
+                                            let lost = pkt_seq - prev_seq - 1;
+                                            if lost > 0 && lost <= 6 {
+                                                let plc_frames = lost.min(2);
+                                                for _ in 0..plc_frames {
+                                                    if let Ok(plc_len) = peer.decoder.decode_float(
+                                                        &[],
+                                                        &mut decoded_frame,
+                                                        true,
+                                                    ) {
+                                                        peer.audio_queue.extend_from_slice(
+                                                            &decoded_frame[..plc_len],
+                                                        );
+                                                    }
+                                                }
+                                            } else if lost > 6 {
+                                                peer.jitter_primed = false;
+                                            }
+                                        }
+                                        peer.last_seq = Some(pkt_seq);
+
                                         if let Ok(decoded_len) = peer.decoder.decode_float(
                                             &opus_data,
                                             &mut decoded_frame,
                                             false,
                                         ) {
                                             peer.last_spoke = Instant::now();
-                                            if peer.audio_queue.len() > FRAME_SIZE * 12 {
-                                                peer.audio_queue.drain(0..FRAME_SIZE * 6);
+                                            if peer.audio_queue.len() > FRAME_SIZE * 8 {
+                                                let excess =
+                                                    peer.audio_queue.len() - FRAME_SIZE * 4;
+                                                peer.audio_queue.drain(0..excess);
                                             }
                                             peer.audio_queue
                                                 .extend_from_slice(&decoded_frame[..decoded_len]);
@@ -1767,12 +2053,21 @@ impl GGVoiceApp {
                     {
                         let mut peers = state_rx.room.peers.lock().unwrap();
                         for peer in peers.values_mut() {
+                            if !peer.jitter_primed {
+                                if peer.audio_queue.len() >= FRAME_SIZE * 2 {
+                                    peer.jitter_primed = true;
+                                } else {
+                                    continue;
+                                }
+                            }
                             if peer.audio_queue.len() >= FRAME_SIZE {
                                 any_ready = true;
                                 let vol = peer.volume;
                                 for (i, s) in peer.audio_queue.drain(0..FRAME_SIZE).enumerate() {
                                     mixed[i] += s * vol;
                                 }
+                            } else {
+                                peer.jitter_primed = false;
                             }
                         }
                     }
@@ -1820,6 +2115,11 @@ impl GGVoiceApp {
             available_update,
             desk_texture,
             welcome_game: MiniGameAnim::default(),
+            audio_epoch,
+            in_error_flag,
+            in_heartbeat_ms,
+            out_error_flag,
+            last_audio_recovery: Instant::now(),
             input_stream: Some(input_stream),
             output_stream: Some(output_stream),
         }
@@ -1831,20 +2131,37 @@ impl GGVoiceApp {
             let old_stream = self.input_stream.take();
             drop(old_stream);
 
+            self.in_error_flag.store(false, Ordering::Relaxed);
+            self.in_heartbeat_ms.store(
+                self.audio_epoch.elapsed().as_millis() as u32,
+                Ordering::Relaxed,
+            );
+
             let (new_prod, new_cons) = HeapRb::<f32>::new(FRAME_SIZE * 24).split();
-            if let Ok((new_stream, actual_name)) = build_input_stream_for_device(&dev, new_prod) {
+            if let Ok((new_stream, actual_name)) = build_input_stream_for_device(
+                &dev,
+                new_prod,
+                self.in_error_flag.clone(),
+                self.in_heartbeat_ms.clone(),
+                self.audio_epoch,
+            ) {
                 *self.cons_in_shared.lock().unwrap() = new_cons;
                 self.input_stream = Some(new_stream);
                 self.mic_name = actual_name;
                 self.persist_current_prefs();
-            } else if let Ok(fallback_dev) = find_input_device(&host, &self.mic_name) {
+            } else if let Ok(fallback_dev) = find_input_device(&host, "") {
                 let (fb_prod, fb_cons) = HeapRb::<f32>::new(FRAME_SIZE * 24).split();
-                if let Ok((fb_stream, fb_name)) =
-                    build_input_stream_for_device(&fallback_dev, fb_prod)
-                {
+                if let Ok((fb_stream, fb_name)) = build_input_stream_for_device(
+                    &fallback_dev,
+                    fb_prod,
+                    self.in_error_flag.clone(),
+                    self.in_heartbeat_ms.clone(),
+                    self.audio_epoch,
+                ) {
                     *self.cons_in_shared.lock().unwrap() = fb_cons;
                     self.input_stream = Some(fb_stream);
                     self.mic_name = fb_name;
+                    self.persist_current_prefs();
                 }
             }
         }
@@ -1856,6 +2173,8 @@ impl GGVoiceApp {
             let old_stream = self.output_stream.take();
             drop(old_stream);
 
+            self.out_error_flag.store(false, Ordering::Relaxed);
+
             let (new_prod_out, new_cons_out) = HeapRb::<f32>::new(FRAME_SIZE * 28).split();
             let (new_prod_lb, new_cons_lb) = HeapRb::<f32>::new(FRAME_SIZE * 16).split();
             if let Ok((new_stream, actual_name)) = build_output_stream_for_device(
@@ -1863,13 +2182,14 @@ impl GGVoiceApp {
                 self.state.clone(),
                 new_cons_out,
                 new_cons_lb,
+                self.out_error_flag.clone(),
             ) {
                 *self.prod_out_shared.lock().unwrap() = new_prod_out;
                 *self.prod_lb_shared.lock().unwrap() = new_prod_lb;
                 self.output_stream = Some(new_stream);
                 self.out_name = actual_name;
                 self.persist_current_prefs();
-            } else if let Ok(fallback_dev) = find_output_device(&host, &self.out_name) {
+            } else if let Ok(fallback_dev) = find_output_device(&host, "") {
                 let (fb_prod_out, fb_cons_out) = HeapRb::<f32>::new(FRAME_SIZE * 28).split();
                 let (fb_prod_lb, fb_cons_lb) = HeapRb::<f32>::new(FRAME_SIZE * 16).split();
                 if let Ok((fb_stream, fb_name)) = build_output_stream_for_device(
@@ -1877,11 +2197,13 @@ impl GGVoiceApp {
                     self.state.clone(),
                     fb_cons_out,
                     fb_cons_lb,
+                    self.out_error_flag.clone(),
                 ) {
                     *self.prod_out_shared.lock().unwrap() = fb_prod_out;
                     *self.prod_lb_shared.lock().unwrap() = fb_prod_lb;
                     self.output_stream = Some(fb_stream);
                     self.out_name = fb_name;
+                    self.persist_current_prefs();
                 }
             }
         }
@@ -1896,6 +2218,8 @@ impl GGVoiceApp {
             self.state.ptt_enabled.load(Ordering::Relaxed),
             self.state.ptt_vk.load(Ordering::Relaxed),
             self.state.boost_enabled.load(Ordering::Relaxed),
+            self.state.sounds_enabled.load(Ordering::Relaxed),
+            self.state.ns_level.load(Ordering::Relaxed),
             &self.mic_name,
             &self.out_name,
         );
@@ -1923,8 +2247,15 @@ impl GGVoiceApp {
         thread::spawn(move || {
             let (room_hash, key) = derive_room_secrets(&room_name, &password);
             let my_id = state.room.my_id;
-            let pub_addr = *state.public_addr.lock().unwrap();
-            let my_blob = encrypt_addr_blob(pub_addr, &key);
+            let fresh_pub = if let Ok(probe_sock) = UdpSocket::bind("0.0.0.0:0") {
+                discover_public_addr(&probe_sock).unwrap_or_else(|_| *state.public_addr.lock().unwrap())
+            } else {
+                *state.public_addr.lock().unwrap()
+            };
+            *state.public_addr.lock().unwrap() = fresh_pub;
+            let fresh_lan = detect_local_lan_addr(fresh_pub.port());
+            *state.lan_addr.lock().unwrap() = fresh_lan;
+            let my_blob = encrypt_endpoints_blob(fresh_pub, fresh_lan, &key);
 
             match beacon_sync_mesh(&room_hash, my_id, &my_blob) {
                 Ok(mesh_list) => {
@@ -1938,7 +2269,8 @@ impl GGVoiceApp {
                         if pid == my_id {
                             continue;
                         }
-                        if let Ok(peer_addr) = decrypt_addr_blob(&blob, &key) {
+                        if let Ok((wan_addr, lan_addr)) = decrypt_endpoints_blob(&blob, &key) {
+                            let peer_addr = lan_addr.unwrap_or(wan_addr);
                             if peers.len() + 1 < MAX_ROOM_USERS {
                                 if let Ok(dec) = Decoder::new(SAMPLE_RATE, Channels::Mono) {
                                     peers.insert(
@@ -1947,10 +2279,13 @@ impl GGVoiceApp {
                                             id: pid,
                                             name: format!("Player_{:04}", pid % 10000),
                                             addr: peer_addr,
+                                            lan_addr,
                                             volume: 1.0,
                                             last_seen: Instant::now(),
                                             last_spoke: Instant::now() - Duration::from_secs(5),
                                             connected: false,
+                                            last_seq: None,
+                                            jitter_primed: false,
                                             decoder: dec,
                                             audio_queue: Vec::with_capacity(FRAME_SIZE * 6),
                                         },
@@ -1962,6 +2297,7 @@ impl GGVoiceApp {
 
                     state.room.in_room.store(true, Ordering::Relaxed);
                     *state.status_text.lock().unwrap() = "Online (1/20)".to_string();
+                    state.play_cue(UiCueKind::Join, false);
                 }
                 Err(_) => {
                     *state.status_text.lock().unwrap() =
@@ -1977,9 +2313,12 @@ impl GGVoiceApp {
         let room_hash = self.state.room.room_hash.lock().unwrap().clone();
         let my_id = self.state.room.my_id;
 
-        self.state.room.in_room.store(false, Ordering::Relaxed);
+        let was_in_room = self.state.room.in_room.swap(false, Ordering::Relaxed);
         self.state.room.peers.lock().unwrap().clear();
         *self.state.status_text.lock().unwrap() = "Offline".to_string();
+        if was_in_room {
+            self.state.play_cue(UiCueKind::Leave, false);
+        }
 
         if !room_hash.is_empty() {
             thread::spawn(move || {
@@ -2209,11 +2548,33 @@ impl eframe::App for GGVoiceApp {
             }
         }
 
-        if self.last_device_scan.elapsed() >= Duration::from_secs(4) {
+        if self.last_device_scan.elapsed() >= Duration::from_secs(3) {
             let host = cpal::default_host();
             self.available_mics = list_input_devices(&host);
             self.available_outs = list_output_devices(&host);
             self.last_device_scan = Instant::now();
+
+            let now_ms = self.audio_epoch.elapsed().as_millis() as u32;
+            let last_hb = self.in_heartbeat_ms.load(Ordering::Relaxed);
+            let stalled_in = now_ms > 3000 && now_ms.saturating_sub(last_hb) > 1800;
+            let mic_missing = !self.mic_name.is_empty() && !self.available_mics.contains(&self.mic_name);
+
+            if (self.in_error_flag.load(Ordering::Relaxed) || stalled_in || mic_missing)
+                && self.last_audio_recovery.elapsed() >= Duration::from_secs(3)
+            {
+                self.last_audio_recovery = Instant::now();
+                let target = if mic_missing { "" } else { &self.mic_name.clone() };
+                self.switch_input_device(target);
+            }
+
+            let out_missing = !self.out_name.is_empty() && !self.available_outs.contains(&self.out_name);
+            if (self.out_error_flag.load(Ordering::Relaxed) || out_missing)
+                && self.last_audio_recovery.elapsed() >= Duration::from_secs(3)
+            {
+                self.last_audio_recovery = Instant::now();
+                let target = if out_missing { "" } else { &self.out_name.clone() };
+                self.switch_output_device(target);
+            }
         }
 
         // 1. НИЖНЯЯ СТАТИЧНАЯ ПАНЕЛЬ
@@ -2230,6 +2591,56 @@ impl eframe::App for GGVoiceApp {
                 let ptt_down = self.state.ptt_active.load(Ordering::Relaxed);
                 let lb_on = self.state.loopback_enabled.load(Ordering::Relaxed);
                 let boost_on = self.state.boost_enabled.load(Ordering::Relaxed);
+
+                let cur_ns = self.state.ns_level.load(Ordering::Relaxed).clamp(1, 10);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("ШУМОДАВ: {}/10", cur_ns))
+                            .size(9.5)
+                            .color(RETRO_GRAY),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (ns_rect, ns_resp) = ui.allocate_exact_size(
+                            egui::vec2(132.0, 11.0),
+                            egui::Sense::click_and_drag(),
+                        );
+                        if ns_resp.double_clicked() {
+                            self.state.ns_level.store(6, Ordering::Relaxed);
+                            self.persist_current_prefs();
+                        } else if ns_resp.clicked() || ns_resp.dragged() {
+                            if let Some(pos) = ns_resp.interact_pointer_pos() {
+                                let frac = ((pos.x - ns_rect.left()) / ns_rect.width()).clamp(0.0, 1.0);
+                                let new_ns = ((frac * 9.0).round() as i32 + 1).clamp(1, 10);
+                                if new_ns != cur_ns {
+                                    self.state.ns_level.store(new_ns, Ordering::Relaxed);
+                                    self.persist_current_prefs();
+                                }
+                            }
+                        }
+
+                        let p = ui.painter();
+                        let bcol = if ns_resp.hovered() || ns_resp.dragged() {
+                            CYBER_MINT
+                        } else {
+                            RETRO_BORDER
+                        };
+                        p.rect_filled(ns_rect, 0.0, PANEL_BLACK);
+                        p.rect_stroke(ns_rect, 0.0, egui::Stroke::new(1.0_f32, bcol));
+                        let ratio = (cur_ns as f32 - 1.0) / 9.0;
+                        let inner_w = (ns_rect.width() - 4.0).max(2.0);
+                        p.rect_filled(
+                            egui::Rect::from_min_size(
+                                ns_rect.min + egui::vec2(2.0, 2.0),
+                                egui::vec2((inner_w * ratio).max(4.0), ns_rect.height() - 4.0),
+                            ),
+                            0.0,
+                            RETRO_PINK,
+                        );
+                    });
+                });
+
+                ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
                     let sig_title = if lb_on {
@@ -2274,6 +2685,30 @@ impl eframe::App for GGVoiceApp {
                                 .store(!lb_on, Ordering::Relaxed);
                         }
 
+                        let sounds_on = self.state.sounds_enabled.load(Ordering::Relaxed);
+                        let sound_btn = egui::Button::new(
+                            egui::RichText::new(if sounds_on { "ЗВУК: ВКЛ" } else { "ЗВУК: ВЫКЛ" })
+                                .size(9.0)
+                                .strong()
+                                .color(if sounds_on {
+                                    VOID_BLACK
+                                } else {
+                                    RETRO_GRAY
+                                }),
+                        )
+                        .fill(if sounds_on { RETRO_PINK } else { PANEL_BLACK });
+
+                        if ui.add_sized([74.0, 18.0], sound_btn).clicked() {
+                            let next_val = !sounds_on;
+                            self.state
+                                .sounds_enabled
+                                .store(next_val, Ordering::Relaxed);
+                            self.persist_current_prefs();
+                            if next_val {
+                                self.state.play_cue(UiCueKind::Join, true);
+                            }
+                        }
+
                         let boost_btn = egui::Button::new(
                             egui::RichText::new(if boost_on { "БУСТ: ВКЛ" } else { "БУСТ" })
                                 .size(9.0)
@@ -2286,7 +2721,7 @@ impl eframe::App for GGVoiceApp {
                         )
                         .fill(if boost_on { RETRO_PINK } else { PANEL_BLACK });
 
-                        if ui.add_sized([68.0, 18.0], boost_btn).clicked() {
+                        if ui.add_sized([62.0, 18.0], boost_btn).clicked() {
                             self.state
                                 .boost_enabled
                                 .store(!boost_on, Ordering::Relaxed);
@@ -2837,9 +3272,11 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let res = eframe::run_native(
         WINDOW_TITLE,
         options,
         Box::new(|cc| Ok(Box::new(GGVoiceApp::new(cc)))),
-    )
+    );
+    release_single_instance_lock();
+    res
 }
