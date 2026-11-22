@@ -529,7 +529,6 @@ struct PeerNode {
     id: u64,
     name: String,
     addr: SocketAddr,
-    lan_addr: Option<SocketAddr>,
     volume: f32,
     last_seen: Instant,
     last_spoke: Instant,
@@ -563,8 +562,7 @@ struct SharedState {
     my_speaking: AtomicBool,
     status_text: Mutex<String>,
     public_addr: Mutex<SocketAddr>,
-    lan_addr: Mutex<Option<SocketAddr>>,
-    ns_level: AtomicI32, // 1..10 per-user noise suppression strictness (default 6)
+    ns_level: AtomicI32, // 1..10 noise suppression strictness (default 5)
     room: RoomState,
 }
 
@@ -592,8 +590,7 @@ impl SharedState {
             my_speaking: AtomicBool::new(false),
             status_text: Mutex::new("Offline".to_string()),
             public_addr: Mutex::new(public_addr),
-            lan_addr: Mutex::new(detect_local_lan_addr(public_addr.port())),
-            ns_level: AtomicI32::new(6),
+            ns_level: AtomicI32::new(5),
             room: RoomState {
                 my_id: client_id,
                 my_name: Mutex::new(initial_nick),
@@ -628,8 +625,9 @@ impl SharedState {
     }
 }
 
-fn query_single_stun(socket: &UdpSocket, stun_server: &str) -> Result<SocketAddr> {
-    socket.set_read_timeout(Some(Duration::from_millis(1200)))?;
+fn discover_public_addr(socket: &UdpSocket) -> Result<SocketAddr> {
+    let stun_server = "stun.l.google.com:19302";
+    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
 
     let mut req = [0u8; 20];
     req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
@@ -666,42 +664,11 @@ fn query_single_stun(socket: &UdpSocket, stun_server: &str) -> Result<SocketAddr
     Err(anyhow!("No XOR-MAPPED-ADDRESS"))
 }
 
-fn discover_public_addr(socket: &UdpSocket) -> Result<SocketAddr> {
-    let stun_servers = [
-        "stun.l.google.com:19302",
-        "stun1.l.google.com:19302",
-        "global.stun.twilio.com:3478",
-    ];
-    for srv in stun_servers {
-        if let Ok(addr) = query_single_stun(socket, srv) {
-            return Ok(addr);
-        }
-    }
-    Err(anyhow!("All STUN servers failed"))
-}
-
-fn detect_local_lan_addr(bound_port: u16) -> Option<SocketAddr> {
-    let probe = UdpSocket::bind("0.0.0.0:0").ok()?;
-    let _ = probe.connect("8.8.8.8:80");
-    match probe.local_addr().ok()? {
-        SocketAddr::V4(v4) if !v4.ip().is_loopback() && !v4.ip().is_unspecified() => {
-            Some(SocketAddr::V4(SocketAddrV4::new(*v4.ip(), bound_port)))
-        }
-        _ => None,
-    }
-}
-
-// Encodes WAN (6 bytes) + LAN (6 bytes) -> 12 bytes plaintext inside ChaCha20Poly1305 blob.
-// Backward-compatible with legacy 6-byte blobs on decrypt!
-fn encrypt_endpoints_blob(wan_addr: SocketAddr, lan_addr: Option<SocketAddr>, key: &[u8; 32]) -> String {
-    let mut raw = [0u8; 12];
-    if let SocketAddr::V4(v4) = wan_addr {
+fn encrypt_addr_blob(addr: SocketAddr, key: &[u8; 32]) -> String {
+    let mut raw = [0u8; 6];
+    if let SocketAddr::V4(v4) = addr {
         raw[0..4].copy_from_slice(&v4.ip().octets());
         raw[4..6].copy_from_slice(&v4.port().to_be_bytes());
-    }
-    if let Some(SocketAddr::V4(l4)) = lan_addr {
-        raw[6..10].copy_from_slice(&l4.ip().octets());
-        raw[10..12].copy_from_slice(&l4.port().to_be_bytes());
     }
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
@@ -715,7 +682,7 @@ fn encrypt_endpoints_blob(wan_addr: SocketAddr, lan_addr: Option<SocketAddr>, ke
     URL_SAFE_NO_PAD.encode(&out)
 }
 
-fn decrypt_endpoints_blob(blob: &str, key: &[u8; 32]) -> Result<(SocketAddr, Option<SocketAddr>)> {
+fn decrypt_addr_blob(blob: &str, key: &[u8; 32]) -> Result<SocketAddr> {
     let data = URL_SAFE_NO_PAD.decode(blob)?;
     if data.len() < 12 + 6 {
         return Err(anyhow!("Invalid blob"));
@@ -725,26 +692,12 @@ fn decrypt_endpoints_blob(blob: &str, key: &[u8; 32]) -> Result<(SocketAddr, Opt
     let pt = cipher
         .decrypt(nonce, &data[12..])
         .map_err(|_| anyhow!("Wrong password"))?;
-    if pt.len() != 6 && pt.len() != 12 {
+    if pt.len() != 6 {
         return Err(anyhow!("Bad addr len"));
     }
-    let wan_ip = Ipv4Addr::new(pt[0], pt[1], pt[2], pt[3]);
-    let wan_port = u16::from_be_bytes([pt[4], pt[5]]);
-    let wan_addr = SocketAddr::V4(SocketAddrV4::new(wan_ip, wan_port));
-
-    let lan_addr = if pt.len() == 12 {
-        let lan_ip = Ipv4Addr::new(pt[6], pt[7], pt[8], pt[9]);
-        let lan_port = u16::from_be_bytes([pt[10], pt[11]]);
-        if !lan_ip.is_unspecified() && !lan_ip.is_loopback() && lan_port > 0 {
-            Some(SocketAddr::V4(SocketAddrV4::new(lan_ip, lan_port)))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    Ok((wan_addr, lan_addr))
+    let ip = Ipv4Addr::new(pt[0], pt[1], pt[2], pt[3]);
+    let port = u16::from_be_bytes([pt[4], pt[5]]);
+    Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
 }
 
 fn parse_mesh_peers(json: &str) -> Vec<(u64, String)> {
@@ -1578,8 +1531,7 @@ impl GGVoiceApp {
 
                     if last_announce.elapsed() >= Duration::from_secs(20) {
                         let pub_addr = *state_beacon.public_addr.lock().unwrap();
-                        let lan_addr = *state_beacon.lan_addr.lock().unwrap();
-                        let my_blob = encrypt_endpoints_blob(pub_addr, lan_addr, &key);
+                        let my_blob = encrypt_addr_blob(pub_addr, &key);
                         let _ = beacon_sync_mesh(&room_hash, my_id, &my_blob);
                         last_announce = Instant::now();
                     }
@@ -1601,17 +1553,14 @@ impl GGVoiceApp {
                                 if pid == my_id {
                                     continue;
                                 }
-                                if let Ok((wan_addr, lan_addr)) = decrypt_endpoints_blob(&blob, &key) {
-                                    if let Some(la) = lan_addr {
-                                        targets_to_punch.push(la);
+                                if let Ok(peer_addr) = decrypt_addr_blob(&blob, &key) {
+                                    if !targets_to_punch.contains(&peer_addr) {
+                                        targets_to_punch.push(peer_addr);
                                     }
-                                    targets_to_punch.push(wan_addr);
-                                    let chosen_addr = lan_addr.unwrap_or(wan_addr);
 
                                     if let Some(existing) = peers.get_mut(&pid) {
-                                        existing.lan_addr = lan_addr;
                                         if !existing.connected {
-                                            existing.addr = chosen_addr;
+                                            existing.addr = peer_addr;
                                             existing.last_seen = Instant::now();
                                         }
                                     } else if peers.len() + 1 < MAX_ROOM_USERS {
@@ -1621,8 +1570,7 @@ impl GGVoiceApp {
                                                 PeerNode {
                                                     id: pid,
                                                     name: format!("Player_{:04}", pid % 10000),
-                                                    addr: chosen_addr,
-                                                    lan_addr,
+                                                    addr: peer_addr,
                                                     volume: 1.0,
                                                     last_seen: Instant::now(),
                                                     last_spoke: Instant::now() - Duration::from_secs(5),
@@ -1743,9 +1691,9 @@ impl GGVoiceApp {
                         continue;
                     }
 
-                    // 1. Шумоподавление nnnoiseless + индивидуальная чувствительность VAD (ns_level 1..10)
+                    // 1. Шумоподавление nnnoiseless + плавная настройка порога (ns_level 1..10) без обрезания речи
                     let ns = state_tx.ns_level.load(Ordering::Relaxed).clamp(1, 10) as f32;
-                    let norm_ns = (ns - 1.0) / 9.0; // 0.0 (мягко) .. 1.0 (строго против фона/телефона)
+                    let norm_ns = (ns - 1.0) / 9.0; // 0.0 .. 1.0
 
                     let vad_prob = denoise.process_frame(&mut clean_frame, &raw_frame);
                     let mut sum_sq = 0.0f32;
@@ -1755,12 +1703,13 @@ impl GGVoiceApp {
                     }
                     let rms = (sum_sq / FRAME_SIZE as f32).sqrt();
 
-                    let primary_vad_thresh = 0.16 + norm_ns * 0.36; // 0.16 .. 0.52
-                    let primary_rms_thresh = 0.0020 + norm_ns * 0.0065; // 0.0020 .. 0.0085
-                    let secondary_vad_thresh = 0.12 + norm_ns * 0.28; // 0.12 .. 0.40
-                    let secondary_rms_thresh = 0.0040 + norm_ns * 0.0090; // 0.0040 .. 0.0130
-                    let hold_primary: u32 = ((28.0 - norm_ns * 14.0).round() as u32).max(10);
-                    let hold_secondary: u32 = ((16.0 - norm_ns * 8.0).round() as u32).max(6);
+                    // Умеренный диапазон порогов, чтобы голос не «рассыпался» на слоги при любом значении ползунка
+                    let primary_vad_thresh = 0.14 + norm_ns * 0.22; // 0.14 .. 0.36
+                    let primary_rms_thresh = 0.0018 + norm_ns * 0.0042; // 0.0018 .. 0.0060
+                    let secondary_vad_thresh = 0.10 + norm_ns * 0.16; // 0.10 .. 0.26
+                    let secondary_rms_thresh = 0.0032 + norm_ns * 0.0048; // 0.0032 .. 0.0080
+                    let hold_primary: u32 = ((32.0 - norm_ns * 8.0).round() as u32).max(20);
+                    let hold_secondary: u32 = ((20.0 - norm_ns * 5.0).round() as u32).max(14);
 
                     if vad_prob > primary_vad_thresh && rms > primary_rms_thresh {
                         vad_hold_frames = hold_primary;
@@ -1777,7 +1726,7 @@ impl GGVoiceApp {
                         state_tx.ptt_active.store(key_down, Ordering::Relaxed);
 
                         if key_down {
-                            ptt_hold_frames = 20;
+                            ptt_hold_frames = 22;
                         } else if ptt_hold_frames > 0 {
                             ptt_hold_frames -= 1;
                         }
@@ -1787,9 +1736,9 @@ impl GGVoiceApp {
                         vad_hold_frames > 0
                     };
 
-                    // 2. Плавное открытие и закрытие гейта тишины (без щелчков и «пиксельности»)
+                    // 2. Плавный гейт тишины с мягким спадом (~100-140 мс), чтобы не рвать окончания слов
                     let target_env = if speaking { 1.0 } else { 0.0 };
-                    let close_step = 0.12 + norm_ns * 0.14;
+                    let close_step = 0.07 + norm_ns * 0.05;
                     if target_env > gate_env {
                         gate_env = (gate_env + 0.55).min(1.0);
                     } else {
@@ -1940,8 +1889,7 @@ impl GGVoiceApp {
                                                     name
                                                 },
                                                 addr: src,
-                                                lan_addr: None,
-                                                volume: 1.0,
+                                                                                                volume: 1.0,
                                                 last_seen: Instant::now(),
                                                 last_spoke: Instant::now() - Duration::from_secs(5),
                                                 connected: true,
@@ -1981,8 +1929,7 @@ impl GGVoiceApp {
                                                     id: sender_id,
                                                     name: format!("Player_{:04}", sender_id % 10000),
                                                     addr: src,
-                                                    lan_addr: None,
-                                                    volume: 1.0,
+                                                                                                        volume: 1.0,
                                                     last_seen: Instant::now(),
                                                     last_spoke: Instant::now(),
                                                     connected: true,
@@ -2066,8 +2013,6 @@ impl GGVoiceApp {
                                 for (i, s) in peer.audio_queue.drain(0..FRAME_SIZE).enumerate() {
                                     mixed[i] += s * vol;
                                 }
-                            } else {
-                                peer.jitter_primed = false;
                             }
                         }
                     }
@@ -2225,7 +2170,7 @@ impl GGVoiceApp {
         );
     }
 
-    fn enter_room(&mut self) {
+        fn enter_room(&mut self) {
         if self.joining_in_progress.load(Ordering::Relaxed) {
             return;
         }
@@ -2247,15 +2192,8 @@ impl GGVoiceApp {
         thread::spawn(move || {
             let (room_hash, key) = derive_room_secrets(&room_name, &password);
             let my_id = state.room.my_id;
-            let fresh_pub = if let Ok(probe_sock) = UdpSocket::bind("0.0.0.0:0") {
-                discover_public_addr(&probe_sock).unwrap_or_else(|_| *state.public_addr.lock().unwrap())
-            } else {
-                *state.public_addr.lock().unwrap()
-            };
-            *state.public_addr.lock().unwrap() = fresh_pub;
-            let fresh_lan = detect_local_lan_addr(fresh_pub.port());
-            *state.lan_addr.lock().unwrap() = fresh_lan;
-            let my_blob = encrypt_endpoints_blob(fresh_pub, fresh_lan, &key);
+            let pub_addr = *state.public_addr.lock().unwrap();
+            let my_blob = encrypt_addr_blob(pub_addr, &key);
 
             match beacon_sync_mesh(&room_hash, my_id, &my_blob) {
                 Ok(mesh_list) => {
@@ -2269,8 +2207,7 @@ impl GGVoiceApp {
                         if pid == my_id {
                             continue;
                         }
-                        if let Ok((wan_addr, lan_addr)) = decrypt_endpoints_blob(&blob, &key) {
-                            let peer_addr = lan_addr.unwrap_or(wan_addr);
+                        if let Ok(peer_addr) = decrypt_addr_blob(&blob, &key) {
                             if peers.len() + 1 < MAX_ROOM_USERS {
                                 if let Ok(dec) = Decoder::new(SAMPLE_RATE, Channels::Mono) {
                                     peers.insert(
@@ -2279,7 +2216,6 @@ impl GGVoiceApp {
                                             id: pid,
                                             name: format!("Player_{:04}", pid % 10000),
                                             addr: peer_addr,
-                                            lan_addr,
                                             volume: 1.0,
                                             last_seen: Instant::now(),
                                             last_spoke: Instant::now() - Duration::from_secs(5),
