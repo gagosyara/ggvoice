@@ -31,7 +31,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 // === КОНФИГУРАЦИЯ ПРОЕКТА И GITHUB RELEASES ===
-const APP_VERSION: &str = "1.0.2";
+const APP_VERSION: &str = "1.0.3";
 const GITHUB_REPO: &str = "gagosyara/ggvoice";
 const GITHUB_RELEASES_LATEST_URL: &str = "https://github.com/gagosyara/ggvoice/releases/latest";
 const BEACON_URL: &str = "https://ggvoice-beacon.nikiforgagos.workers.dev";
@@ -497,6 +497,65 @@ fn generate_gg_icon() -> egui::IconData {
         width: size as u32,
         height: size as u32,
     }
+}
+
+
+fn encode_invite_code(room: &str, password: &str) -> String {
+    let r_bytes = room.trim().as_bytes();
+    let p_bytes = password.trim().as_bytes();
+    let r_len = r_bytes.len().min(u16::MAX as usize) as u16;
+    let mut raw = Vec::with_capacity(2 + r_len as usize + p_bytes.len());
+    raw.extend_from_slice(&r_len.to_be_bytes());
+    raw.extend_from_slice(&r_bytes[..r_len as usize]);
+    raw.extend_from_slice(p_bytes);
+    format!("ggvoice://join?invite={}", URL_SAFE_NO_PAD.encode(&raw))
+}
+
+fn decode_invite_code(input: &str) -> Option<(String, String)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let token = if let Some(pos) = trimmed.find("invite=") {
+        trimmed[pos + "invite=".len()..]
+            .split('&')
+            .next()
+            .unwrap_or("")
+            .trim()
+    } else if let Some(rest) = trimmed.strip_prefix("ggvoice://join") {
+        rest.trim_start_matches('?').trim()
+    } else {
+        trimmed
+    };
+
+    if let Ok(raw) = URL_SAFE_NO_PAD.decode(token) {
+        if raw.len() >= 2 {
+            let r_len = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+            if raw.len() >= 2 + r_len {
+                let r_bytes = &raw[2..2 + r_len];
+                let p_bytes = &raw[2 + r_len..];
+                if let (Ok(room), Ok(pass)) = (
+                    String::from_utf8(r_bytes.to_vec()),
+                    String::from_utf8(p_bytes.to_vec()),
+                ) {
+                    if !room.trim().is_empty() {
+                        return Some((room, pass));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback for plain `ggvoice:room:pass` or `room:pass`
+    let plain = trimmed.strip_prefix("ggvoice:").unwrap_or(trimmed);
+    if let Some((r, p)) = plain.split_once(':') {
+        if !r.trim().is_empty() {
+            return Some((r.trim().to_string(), p.trim().to_string()));
+        }
+    }
+
+    None
 }
 
 fn derive_room_secrets(room_name: &str, password: &str) -> (String, [u8; 32]) {
@@ -1357,6 +1416,10 @@ struct GGVoiceApp {
     available_update: Arc<Mutex<Option<UpdateInfo>>>,
     desk_texture: Option<egui::TextureHandle>,
     welcome_game: MiniGameAnim,
+    invite_feedback: Option<(String, Instant)>,
+    invite_modal_open: bool,
+    invite_code_input: String,
+    invite_modal_error: Option<String>,
     audio_epoch: Instant,
     in_error_flag: Arc<AtomicBool>,
     in_heartbeat_ms: Arc<AtomicU32>,
@@ -2060,6 +2123,10 @@ impl GGVoiceApp {
             available_update,
             desk_texture,
             welcome_game: MiniGameAnim::default(),
+            invite_feedback: None,
+            invite_modal_open: false,
+            invite_code_input: String::new(),
+            invite_modal_error: None,
             audio_epoch,
             in_error_flag,
             in_heartbeat_ms,
@@ -3020,21 +3087,37 @@ impl eframe::App for GGVoiceApp {
                         "ВОЙТИ В КОМНАТУ"
                     };
 
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 28.0],
-                            egui::Button::new(
-                                egui::RichText::new(btn_label)
-                                    .size(11.0)
-                                    .strong()
-                                    .color(VOID_BLACK),
-                            )
-                            .fill(RETRO_PINK),
+                    ui.horizontal(|ui| {
+                        let paste_btn = egui::Button::new(
+                            egui::RichText::new("ВХОД ПО ИНВАЙТУ")
+                                .size(9.5)
+                                .strong()
+                                .color(CYBER_MINT),
                         )
-                        .clicked()
-                    {
-                        self.enter_room();
-                    }
+                        .fill(PANEL_BLACK);
+
+                        if ui.add_sized([122.0, 28.0], paste_btn).clicked() {
+                            self.invite_code_input.clear();
+                            self.invite_modal_error = None;
+                            self.invite_modal_open = true;
+                        }
+
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 28.0],
+                                egui::Button::new(
+                                    egui::RichText::new(btn_label)
+                                        .size(11.0)
+                                        .strong()
+                                        .color(VOID_BLACK),
+                                )
+                                .fill(RETRO_PINK),
+                            )
+                            .clicked()
+                        {
+                            self.enter_room();
+                        }
+                    });
                 });
             } else {
                 retro_window_box(ui, "КОМНАТА АКТИВНА", true, |ui| {
@@ -3049,7 +3132,7 @@ impl eframe::App for GGVoiceApp {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .add_sized(
-                                    [95.0, 26.0],
+                                    [82.0, 26.0],
                                     egui::Button::new(
                                         egui::RichText::new("ВЫЙТИ")
                                             .size(10.5)
@@ -3062,8 +3145,44 @@ impl eframe::App for GGVoiceApp {
                             {
                                 self.leave_room();
                             }
+
+                            ui.add_space(6.0);
+
+                            if ui
+                                .add_sized(
+                                    [128.0, 26.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("КОПИРОВАТЬ ИНВАЙТ")
+                                            .size(9.5)
+                                            .strong()
+                                            .color(VOID_BLACK),
+                                    )
+                                    .fill(CYBER_MINT),
+                                )
+                                .clicked()
+                            {
+                                let code = encode_invite_code(&self.room_input, &self.pass_input);
+                                ctx.copy_text(code);
+                                self.invite_feedback = Some((
+                                    "Инвайт скопирован в буфер!".to_string(),
+                                    Instant::now(),
+                                ));
+                            }
                         });
                     });
+
+                    if let Some((msg, ts)) = &self.invite_feedback {
+                        if ts.elapsed() < Duration::from_secs(3) {
+                            ui.add_space(5.0);
+                            ui.label(
+                                egui::RichText::new(msg)
+                                    .size(9.5)
+                                    .color(CYBER_MINT),
+                            );
+                        } else {
+                            self.invite_feedback = None;
+                        }
+                    }
                 });
             }
 
@@ -3189,6 +3308,139 @@ impl eframe::App for GGVoiceApp {
                             }
                         });
                 });
+            }
+
+            if self.invite_modal_open && !in_room {
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.invite_modal_open = false;
+                    self.invite_modal_error = None;
+                }
+
+                let mut close_modal = false;
+                let mut try_submit = false;
+
+                egui::Window::new("invite_join_modal")
+                    .title_bar(false)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0))
+                    .fixed_size(egui::vec2(336.0, 134.0))
+                    .frame(
+                        egui::Frame::none()
+                            .fill(PANEL_BLACK)
+                            .stroke(egui::Stroke::new(1.5_f32, CYBER_MINT))
+                            .rounding(egui::Rounding::ZERO)
+                            .inner_margin(egui::Margin::same(12.0_f32)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("ВХОД ПО ПРИГЛАШЕНИЮ")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(CYBER_MINT),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .add_sized(
+                                        [20.0, 18.0],
+                                        egui::Button::new(
+                                            egui::RichText::new("x")
+                                                .size(10.0)
+                                                .color(RETRO_PINK),
+                                        )
+                                        .fill(VOID_BLACK),
+                                    )
+                                    .clicked()
+                                {
+                                    close_modal = true;
+                                }
+                            });
+                        });
+
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("Вставь инвайт-строку от друга (ggvoice://...):")
+                                .size(9.5)
+                                .color(RETRO_GRAY),
+                        );
+                        ui.add_space(4.0);
+
+                        let resp = ui.add_sized(
+                            [ui.available_width(), 26.0],
+                            egui::TextEdit::singleline(&mut self.invite_code_input)
+                                .hint_text("ggvoice://join?invite=..."),
+                        );
+                        if self.invite_code_input.is_empty() && !resp.has_focus() {
+                            resp.request_focus();
+                        }
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            try_submit = true;
+                        }
+
+                        if let Some(err) = &self.invite_modal_error {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(err).size(9.0).color(RETRO_PINK));
+                        } else {
+                            ui.add_space(6.0);
+                        }
+
+                        ui.horizontal(|ui| {
+                            let half_w = (ui.available_width() - 8.0) / 2.0;
+                            if ui
+                                .add_sized(
+                                    [half_w, 26.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("ПОДКЛЮЧИТЬСЯ")
+                                            .size(10.0)
+                                            .strong()
+                                            .color(VOID_BLACK),
+                                    )
+                                    .fill(CYBER_MINT),
+                                )
+                                .clicked()
+                            {
+                                try_submit = true;
+                            }
+
+                            if ui
+                                .add_sized(
+                                    [half_w, 26.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("ОТМЕНА")
+                                            .size(10.0)
+                                            .strong()
+                                            .color(RETRO_GRAY),
+                                    )
+                                    .fill(VOID_BLACK),
+                                )
+                                .clicked()
+                            {
+                                close_modal = true;
+                            }
+                        });
+                    });
+
+                if try_submit {
+                    if let Some((inv_room, inv_pass)) = decode_invite_code(&self.invite_code_input) {
+                        self.room_input = inv_room;
+                        self.pass_input = inv_pass;
+                        self.invite_modal_open = false;
+                        self.invite_modal_error = None;
+                        self.invite_code_input.clear();
+                        self.persist_current_prefs();
+                        self.enter_room();
+                    } else {
+                        self.invite_modal_error = Some(
+                            "Неверный инвайт. Вставь строку вида ggvoice://join?invite=..."
+                                .to_string(),
+                        );
+                    }
+                } else if close_modal {
+                    self.invite_modal_open = false;
+                    self.invite_modal_error = None;
+                    self.invite_code_input.clear();
+                }
             }
         });
     }
